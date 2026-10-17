@@ -1,15 +1,20 @@
-# EDGEAI PRO 1.2
+# EDGEAI PRO 1.4
 
-Streamlit-app med API-Football-baserad målstatistik och separat webbsökning efter odds hos flera spelbolag.
+Streamlit app using API-Football. Entry point: `edgeai_pro/app.py` when repository contains the `edgeai_pro` folder.
 
-## Uppdatera GitHub
-Ersätt `edgeai_pro/app.py` med den här filen. `requirements.txt` är oförändrad.
+## New
+- Automatically requests available pre-match odds for each eligible fixture (multiple bookmakers, up to four result pages).
+- Only attaches a quote when market, selection, team and line can be matched conservatively; otherwise labels it unverified.
+- Optional corner and yellow-card screening from per-fixture historical statistics. This option uses many API calls and is off by default.
+- Applies 1.50 minimum quoted odds and candidate-specific minimum odds.
 
-## Ny odds-funktion
-Öppna `Hitta odds online – flera spelbolag` i appen. En valfri Brave Search API-nyckel kan anges i fältet eller i Streamlit Secrets som `BRAVE_SEARCH_API_KEY`. Sökresultat är länkar och textutdrag, **inte verifierade liveodds**. Utan söknyckel får du en Google-söklänk. Kontrollera odds själv och använd `Kontrollera odds och jämför med minimiodds`.
+## Limitations
+- The analysis engine is still a prototype. It does not yet model 1X2, handicaps, player shots or shots on target.
+- Odds markets vary by bookmaker and fixture; no guarantee of current executable prices. Only exact recognized market/selection pairs are auto-matched.
+- Historical corner/card data may be missing; uncalibrated probability estimates are not validated forecasts.
+- SQLite storage on Streamlit Community Cloud is ephemeral; use external database for persistent history.
+- API-Football quota usage can be substantial when corner/card analysis is enabled.
 
-## API-nycklar
-Lägg aldrig API-nycklar i GitHub. API-Football kan anges som `API_FOOTBALL_KEY` i Streamlit Secrets.
-
-## Begränsningar
-Denna version ger inte fullständig marknadstäckning. Den befintliga analysmodellen analyserar endast målmarknader och båda lagen gör mål. Gratis API-Football kan blockera `last`-parametern och nya säsonger. Historiken lagras i lokal SQLite på Streamlit-servern och kan försvinna vid omstart/omdistribution. Modellens sannolikheter är okalibrerade. Sökresultat från webben ska inte automatiskt tolkas som tillgängliga priser.
+## Deploy
+Replace `edgeai_pro/app.py`, `edgeai_pro/README.md`, and keep `edgeai_pro/requirements.txt`. Streamlit entry point `edgeai_pro/app.py`.
+Keep API keys in Streamlit Secrets, e.g. `API_FOOTBALL_KEY = "..."`, never commit keys.
