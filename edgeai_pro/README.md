@@ -18,3 +18,7 @@ Streamlit app using API-Football. Entry point: `edgeai_pro/app.py` when reposito
 ## Deploy
 Replace `edgeai_pro/app.py`, `edgeai_pro/README.md`, and keep `edgeai_pro/requirements.txt`. Streamlit entry point `edgeai_pro/app.py`.
 Keep API keys in Streamlit Secrets, e.g. `API_FOOTBALL_KEY = "..."`, never commit keys.
+
+
+## Version 1.5 – Bet365-only odds
+Automatiska odds hämtas från API-Football `/odds` med `bookmaker=8` (Bet365). API-svar filtreras dessutom på Bet365-namnet. Om Bet365 saknar odds visas kandidaten som overifierad; odds från andra spelbolag ersätter aldrig dessa. Den frivilliga webbsökningen är endast research och används inte för automatisk ranking. Historiska analyser kan fortfarande visa gamla odds från tidigare versioner.

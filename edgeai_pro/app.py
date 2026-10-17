@@ -14,6 +14,7 @@ BASE='https://v3.football.api-sports.io'
 DB=Path('edgeai_history.sqlite3')
 MIN_MARKET_ODDS = 1.50
 PREFERRED_ODDS = (1.65, 2.50)
+BET365_BOOKMAKER_ID = 8
 
 def connect():
     c=sqlite3.connect(DB)
@@ -138,7 +139,7 @@ def fixture_stat_pair(fixture_id, key, cache, stat_name):
     return {tid:stats[stat_name] for tid,stats in values.items() if stat_name in stats} or None
 
 
-def fetch_fixture_odds(fixture_id,key,bookmaker=None):
+def fetch_fixture_odds(fixture_id,key,bookmaker=BET365_BOOKMAKER_ID):
     """Retrieve all available pre-match odds pages, bounded to avoid runaway calls."""
     offers=[]; errors=[]
     for page in range(1,5):
@@ -150,6 +151,9 @@ def fetch_fixture_odds(fixture_id,key,bookmaker=None):
             errors.append(str(exc));break
         for event in response:
             for book in event.get('bookmakers',[]):
+                # Defense in depth: accept Bet365 only, even if API ignores the filter.
+                if 'bet365' not in norm(book.get('name', '')).replace(' ', ''):
+                    continue
                 for bet in book.get('bets',[]):
                     for value in bet.get('values',[]):
                         try: price=float(str(value.get('odd','')).replace(',','.'))
@@ -206,7 +210,7 @@ def attach_odds(rows,fixtures,key):
     for match,fx in indexed.items():
         relevant=[r for r in rows if r['Match']==match]
         if not relevant:continue
-        offers,err=fetch_fixture_odds(fx['fixture']['id'],key)
+        offers,err=fetch_fixture_odds(fx['fixture']['id'],key,bookmaker=BET365_BOOKMAKER_ID)
         errors.extend([f'{match}: {e}' for e in err])
         for r in relevant:
             choices=[o for o in offers if match_offer(r,o,fx)]
@@ -247,7 +251,7 @@ def bet365_rows(report):
                 rows.append({'Marknad':bet.get('name',''), 'Marknads-ID':bet.get('id',''), 'Antal utfall':len(vals), 'Exempel på utfall':', '.join(str(v.get('value','')) for v in vals[:4])})
     return matching,rows
 
-st.title('⚽ EDGEAI PRO 1.4')
+st.title('⚽ EDGEAI PRO 1.5 – Bet365')
 st.caption('Datadriven matchscreening • inga påhittade odds • samma sparade analys kan öppnas igen')
 with st.sidebar:
     st.header('Inställningar')
@@ -311,7 +315,7 @@ def web_odds_leads(query, token):
     except (requests.RequestException,ValueError) as exc:
         return [],f'Sökningen misslyckades: {exc}'
 
-with st.expander('🌐 Hitta odds online – flera spelbolag',expanded=False):
+with st.expander('🌐 Extern oddssökning (endast research, används inte i rekommendationer)',expanded=False):
     st.write('Sök efter odds på valfri marknad hos offentliga oddswebbplatser. Sökresultat är **ledtrådar**, inte verifierade aktuella odds. Kontrollera alltid exakt marknad, lina, datum och spelbolag.')
     search_key=st.text_input('Brave Search API-nyckel (valfri)',type='password',
         value=st.secrets.get('BRAVE_SEARCH_API_KEY',os.getenv('BRAVE_SEARCH_API_KEY','')),
@@ -331,16 +335,16 @@ with st.expander('🌐 Hitta odds online – flera spelbolag',expanded=False):
                     st.markdown(f"[{lead['Titel']}]({lead['URL']})")
                     st.caption(lead['Utdrag (ej verifierat odds)'])
         st.link_button('Sök samma odds på Google', 'https://www.google.com/search?q='+requests.utils.quote(query))
-    st.caption('Sökningen är inte begränsad till Bet365. Automatisk och tillförlitlig avläsning av aktuella odds kräver oftast en licensierad datakälla.')
+    st.caption('Externa sökresultat används inte som oddsunderlag i analysen. Endast Bet365-odds från API-Football används automatiskt.')
 
 with st.expander('✍️ Kontrollera odds och jämför med minimiodds',expanded=False):
-    st.write('Ange ett odds du själv har kontrollerat. Odds under 1,50 avvisas; intervallet 1,65–2,50 prioriteras, men är inget krav. Detta påverkar inte originalanalysen.')
+    st.write('Manuell kontroll är separat från automatisk ranking. Ange helst Bet365-odds. Odds under 1,50 avvisas; intervallet 1,65–2,50 prioriteras, men är inget krav. Detta påverkar inte originalanalysen.')
     if st.session_state.get('analysis',{}).get('rows'):
         rows=st.session_state['analysis']['rows']
         names=[f"{r['Match']} | {r['Spel']} | min {r['Minimiodds']}" for r in rows]
         idx=st.selectbox('Spelkandidat',range(len(names)),format_func=lambda i:names[i])
         price=st.number_input('Hittat decimalodds',min_value=1.01,max_value=1000.0,value=1.80,step=.05)
-        bookmaker=st.text_input('Spelbolag / källa',placeholder='Bet365, Betsson, Unibet ...')
+        bookmaker=st.text_input('Spelbolag / källa',value='Bet365',help='Manuell kontroll påverkar inte den automatiska rankingen.')
         if st.button('JÄMFÖR ODDS'):
             row=rows[idx]
             edge=100*(price*row['Sannolikhet %']/100-1)
@@ -354,7 +358,7 @@ with st.expander('✍️ Kontrollera odds och jämför med minimiodds',expanded=
     else:st.info('Kör eller öppna en tidigare analys först.')
 
 enable_extra_stats=st.checkbox('Analysera även hörnor och kort (fler API-anrop)',value=False,help='Hämtar statistik per historisk match. Kan använda många API-anrop.')
-enable_odds=st.checkbox('Hämta tillgängliga odds automatiskt (alla spelbolag)',value=True)
+enable_odds=st.checkbox('Hämta Bet365-odds automatiskt (endast Bet365)',value=True)
 run=st.button('▶ KÖR ANALYS',type='primary',disabled=not bool(key and selected))
 if run:
     try:
@@ -395,7 +399,7 @@ p=st.session_state.get('analysis')
 if p:
     st.subheader(f"Analys {p['date']}")
     st.write(f"**{p['matches']} matcher**, **{len(p['rows'])} statistiska spelkandidater**. Analysen sparades {p['created'][:16]} UTC.")
-    st.warning('Version 1.4: mål samt valbara hörn- och kortmarknader. Odds hämtas automatiskt där API-Football erbjuder dem, från flera spelbolag. 1X2, handikapp och spelarskott har ännu ingen fullständig analysmodell. Sannolikheterna är okalibrerade; en träff i odds-API garanterar inte att oddset fortfarande går att spela. Historiken på Streamlit-servern är inte permanent.')
+    st.warning('Version 1.5: mål samt valbara hörn- och kortmarknader. Endast Bet365-odds från API-Football används automatiskt. 1X2, handikapp och spelarskott har ännu ingen fullständig analysmodell. Sannolikheterna är okalibrerade; en träff i odds-API garanterar inte att oddset fortfarande går att spela. Historiken på Streamlit-servern är inte permanent.')
     if p['rows']:
         df=pd.DataFrame(p['rows'])
         cols=['Rank','Match','Tävling','Spel','Sannolikhet %','Sannolikhet 1–10','Minimiodds','Aktuellt odds','Styrka 1–10','Status']
