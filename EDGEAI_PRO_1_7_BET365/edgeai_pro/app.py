@@ -202,6 +202,7 @@ def player_candidates(f, key, fixtures_cache, player_cache, day):
                     if rate<.50:continue
                     # Beta prior and conservative shrinkage; not calibrated to next-match lineup.
                     probability=.5+(((hits+2)/(len(records)+4))-.5)*.7
+                    prob = max(0.01, min(0.99, float(p)))
                     fair=1/prob
                     if fair<MIN_MARKET_ODDS:continue
                     strength=round(min(10,4+3*rate+1.5*prob),1)
