@@ -2,7 +2,7 @@ import os
 import json
 import math
 import sqlite3
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timezone, timedelta
 from pathlib import Path
 import requests
 import pandas as pd
@@ -11,13 +11,15 @@ import streamlit as st
 st.set_page_config(page_title='EDGEAI PRO', page_icon='⚽', layout='wide')
 LEAGUES = {39:'Premier League',140:'La Liga',135:'Serie A',78:'Bundesliga',61:'Ligue 1',88:'Eredivisie',94:'Primeira Liga',2:'Champions League',3:'Europa League',848:'Conference League'}
 BASE='https://v3.football.api-sports.io'
-DB=Path('edgeai_history.sqlite3')
+DB=Path(os.getenv('EDGEAI_DB_PATH','edgeai_history.sqlite3'))
+DB.parent.mkdir(parents=True,exist_ok=True)
 MIN_MARKET_ODDS = 1.50
 PREFERRED_ODDS = (1.65, 2.50)
 BET365_BOOKMAKER_ID = 8
+PLAYER_MIN_APPEARANCES = 5
 
 def connect():
-    c=sqlite3.connect(DB)
+    c=sqlite3.connect(DB,timeout=30)
     c.execute('CREATE TABLE IF NOT EXISTS runs (id INTEGER PRIMARY KEY, created TEXT, match_date TEXT, payload TEXT)')
     c.commit()
     return c
@@ -75,7 +77,7 @@ def candidates(f, key, cache, day, stats_cache=None):
         if fair < MIN_MARKET_ODDS:
             return
         # Two distinct indicators: team performance and opponent concession rate.
-        if hit < 0.40 or opposing_hit < 0.40:
+        if hit < 0.35 or opposing_hit < 0.35:
             return
         minodd=max(MIN_MARKET_ODDS, fair*1.06)
         markets.append({'Match':home['name']+' – '+away['name'],'Tävling':LEAGUES.get(f['league']['id'],'?'),'Spel':name,'Sannolikhet %':round(p*100,1),'Sannolikhet 1–10':max(1,min(10,math.ceil(p*10))),'Minimiodds':round(minodd,2),'Aktuellt odds':'Ej verifierat','Styrka 1–10':round(min(10, 4+2*hit+2*opposing_hit+1.5*max(0,p-.5)),1),'Underlag':notes+f'; lagets träffandel {hit:.0%}, motståndarens insläppta träffandel {opposing_hit:.0%}', 'Status':'KANDIDAT – odds saknas'})
@@ -90,34 +92,126 @@ def candidates(f, key, cache, day, stats_cache=None):
         away_totals=[x+y for x,y in zip(as_,ac)]
         add(f'Över {line+.5} mål',p,sum(x>line for x in actual)/len(actual),sum(x>line for x in away_totals)/len(away_totals),f'Målmodell λ={lh+la:.2f}; baserad på gjorda och insläppta mål')
     add('Båda lagen gör mål', (1-math.exp(-lh))*(1-math.exp(-la)), sum(x>0 for x in hs)/len(hs),sum(x>0 for x in as_)/len(as_), 'Oberoende Poisson-modell, endast målstatistik')
-    # Supplement goal candidates with empirically screened corner/card lines.
-    # API fixture statistics are per-match and not always available; never fill gaps.
+    # 1X2 via independent Poisson goals. These are model estimates, not calibrated probabilities.
+    max_goals=14
+    hp=[math.exp(-lh)*lh**k/math.factorial(k) for k in range(max_goals+1)]
+    ap=[math.exp(-la)*la**k/math.factorial(k) for k in range(max_goals+1)]
+    probs={'1':sum(hp[i]*ap[j] for i in range(max_goals+1) for j in range(i)),
+           'X':sum(hp[i]*ap[i] for i in range(max_goals+1)),
+           '2':sum(hp[i]*ap[j] for j in range(max_goals+1) for i in range(j))}
+    for outcome,prob in probs.items():
+        h_results=[(x>y)-(x<y) for x,y in zip(hs,hc)]
+        a_results=[(x>y)-(x<y) for x,y in zip(as_,ac)]
+        if outcome=='1': own=sum(v==1 for v in h_results)/len(h_results); opp=sum(v==-1 for v in a_results)/len(a_results)
+        elif outcome=='2': own=sum(v==1 for v in a_results)/len(a_results); opp=sum(v==-1 for v in h_results)/len(h_results)
+        else: own=sum(v==0 for v in h_results)/len(h_results); opp=sum(v==0 for v in a_results)/len(a_results)
+        add('1X2 '+outcome,prob,own,opp,'Poisson 1X2 från lagens målmedel')
+    for line in [1,2,3,4]:
+        p_under=1-poisson_tail(lh+la,line)
+        home_tot=[x+y for x,y in zip(hs,hc)]
+        away_tot=[x+y for x,y in zip(as_,ac)]
+        add(f'Under {line+.5} mål',p_under,sum(x<=line for x in home_tot)/len(home_tot),sum(x<=line for x in away_tot)/len(away_tot),f'Poisson totalt λ={lh+la:.2f}')
+    for line in [0,1,2]:
+        for team,scored,conceded,lam in [(home,hs,ac,lh),(away,as_,hc,la)]:
+            add(f"{team['name']} under {line+.5} lagmål",1-poisson_tail(lam,line),sum(x<=line for x in scored)/len(scored),sum(x<=line for x in conceded)/len(conceded),f'Poisson lagmål λ={lam:.2f}')
+
+    # Team corners/cards: multiple lines, using both own and opponent concessions.
     if stats_cache is not None:
-        for category, label, threshold, stat_name in [('corners','hörnor',5,'Corner Kicks'),('cards','gula kort',2,'Yellow Cards')]:
-            for team, own_fixtures, opponent_fixtures in [(home, recent(home['id'],key,day,cache),recent(away['id'],key,day,cache)),(away,recent(away['id'],key,day,cache),recent(home['id'],key,day,cache))]:
-                own=[]; allowed=[]
-                for fx in own_fixtures[:8]:
+        for label,stat_name,lines in [('hörnor','Corner Kicks',[3.5,4.5,5.5,6.5,7.5]),('gula kort','Yellow Cards',[0.5,1.5,2.5,3.5])]:
+            for team,own_fixtures,opponent_fixtures in [(home,recent(home['id'],key,day,cache),recent(away['id'],key,day,cache)),(away,recent(away['id'],key,day,cache),recent(home['id'],key,day,cache))]:
+                own=[];allowed=[]
+                for fx in own_fixtures[:10]:
                     pair=fixture_stat_pair(fx['fixture']['id'],key,stats_cache,stat_name)
                     if pair and team['id'] in pair: own.append(pair[team['id']])
-                allowed=[]
-                for fx in opponent_fixtures[:8]:
+                for fx in opponent_fixtures[:10]:
                     pair=fixture_stat_pair(fx['fixture']['id'],key,stats_cache,stat_name)
-                    if pair and len(pair)==2:
-                        opp_id=away['id'] if team['id']==home['id'] else home['id']
-                        if opp_id in pair:
-                            allowed.append(pair[next(iter(set(pair)-{opp_id}))])
+                    opp_id=away['id'] if team['id']==home['id'] else home['id']
+                    if pair and opp_id in pair and len(pair)==2:
+                        allowed.extend(v for tid,v in pair.items() if tid!=opp_id)
                 if len(own)<5 or len(allowed)<5: continue
-                hit=sum(v>threshold for v in own)/len(own)
-                other=sum(v>threshold for v in allowed)/len(allowed)
-                if min(hit,other)<.45: continue
-                # Conservative shrinkage toward 50%; this is NOT a calibrated probability.
-                prob=.5+(.5*(hit+other)/2-.25)*.65
-                prob=max(.05,min(.85,prob))
-                fair=1/prob
-                if fair<MIN_MARKET_ODDS:continue
-                markets.append({'Match':home['name']+' – '+away['name'],'Tävling':LEAGUES.get(f['league']['id'],'?'),'Spel':f"{team['name']} över {threshold+.5} {label}",'Sannolikhet %':round(prob*100,1),'Sannolikhet 1–10':math.ceil(prob*10),'Minimiodds':round(max(MIN_MARKET_ODDS,fair*1.06),2),'Aktuellt odds':'Ej verifierat','Styrka 1–10':round(4+2*hit+2*other,1),'Underlag':f'{stat_name}: lag {sum(v>threshold for v in own)}/{len(own)}, motståndare tillåter {sum(v>threshold for v in allowed)}/{len(allowed)}. Okalibrerad uppskattning.','Status':'KANDIDAT – odds saknas'})
+                for line in lines:
+                    for direction in ('över','under'):
+                        hit=sum((v>line if direction=='över' else v<line) for v in own)/len(own)
+                        other=sum((v>line if direction=='över' else v<line) for v in allowed)/len(allowed)
+                        if min(hit,other)<.35:continue
+                        # Smoothed hit rates avoid claiming 100% from small samples.
+                        prob=((sum((v>line if direction=='över' else v<line) for v in own)+2)/(len(own)+4)+
+                              (sum((v>line if direction=='över' else v<line) for v in allowed)+2)/(len(allowed)+4))/2
+                        add(f"{team['name']} {direction} {line} {label}",prob,hit,other,f'{stat_name}: lag {hit:.0%} ({len(own)}), motståndare tillåter {other:.0%} ({len(allowed)}); smoothed empirisk uppskattning')
+    # Asian handicap half-goal lines: settle on full-time goal difference.
+    for team,side in ((home,'home'),(away,'away')):
+        for line in (-1.5,-0.5,0.5,1.5):
+            prob=0.0
+            for i,hi in enumerate(hp):
+                for j,aj in enumerate(ap):
+                    diff=(i-j) if side=='home' else (j-i)
+                    if diff+line>0: prob+=hi*aj
+            own_results=[(x-y) for x,y in zip(hs,hc)] if side=='home' else [(x-y) for x,y in zip(as_,ac)]
+            other_results=[(x-y) for x,y in zip(as_,ac)] if side=='home' else [(x-y) for x,y in zip(hs,hc)]
+            own_hit=sum(d+line>0 for d in own_results)/len(own_results)
+            opp_hit=sum(-d+line>0 for d in other_results)/len(other_results)
+            add(f"{team['name']} AH {line:+g}",prob,own_hit,opp_hit,f'Asian handicap {line:+g}; oberoende Poisson för målskillnad')
     return markets,None
 
+
+
+def fixture_player_shots(fixture_id, key, cache):
+    """API-Football /fixtures/players: player shot counts from actual completed fixtures."""
+    if fixture_id not in cache:
+        try:
+            response=api('/fixtures/players',key,{'fixture':fixture_id})
+            data={}
+            for side in response:
+                tid=side.get('team',{}).get('id')
+                if tid is None: continue
+                for entry in side.get('players',[]):
+                    player=entry.get('player') or {}
+                    pid=player.get('id')
+                    if pid is None: continue
+                    stats=entry.get('statistics') or []
+                    if not stats: continue
+                    stat=stats[0]
+                    minutes=(stat.get('games') or {}).get('minutes') or 0
+                    shots=stat.get('shots') or {}
+                    if not isinstance(minutes,(int,float)) or minutes<20: continue
+                    total=shots.get('total'); on=shots.get('on')
+                    if not isinstance(total,(int,float)) or not isinstance(on,(int,float)): continue
+                    data[(tid,pid)]={'name':player.get('name','?'),'shots':int(total),'on':int(on),'minutes':minutes}
+            cache[fixture_id]=data
+        except RuntimeError:
+            cache[fixture_id]={}
+    return cache[fixture_id]
+
+
+def player_candidates(f, key, fixtures_cache, player_cache, day):
+    """Conservative empirical player lines; only players with repeated observed minutes."""
+    from collections import defaultdict
+    result=[]
+    home=f['teams']['home'];away=f['teams']['away']
+    for team in (home,away):
+        observations=defaultdict(list)
+        for fx in recent(team['id'],key,day,fixtures_cache)[:10]:
+            for (tid,pid),v in fixture_player_shots(fx['fixture']['id'],key,player_cache).items():
+                if tid==team['id']: observations[pid].append(v)
+        for pid,records in observations.items():
+            if len(records)<PLAYER_MIN_APPEARANCES:continue
+            for stat,label,lines in [('shots','skott',[0.5,1.5,2.5]),('on','skott på mål',[0.5,1.5])]:
+                for line in lines:
+                    hits=sum(r[stat]>line for r in records)
+                    rate=hits/len(records)
+                    if rate<.50:continue
+                    # Beta prior and conservative shrinkage; not calibrated to next-match lineup.
+                    probability=.5+(((hits+2)/(len(records)+4))-.5)*.7
+                    fair=1/prob
+                    if fair<MIN_MARKET_ODDS:continue
+                    strength=round(min(10,4+3*rate+1.5*prob),1)
+                    result.append({'Match':home['name']+' – '+away['name'],'Tävling':LEAGUES.get(f['league']['id'],'?'),
+                        'Spel':f"{records[0]['name']} över {line} {label}",
+                        'Sannolikhet %':round(prob*100,1),'Sannolikhet 1–10':max(1,min(10,math.ceil(prob*10))),
+                        'Minimiodds':round(max(MIN_MARKET_ODDS,fair*1.06),2),'Aktuellt odds':'Ej verifierat',
+                        'Styrka 1–10':strength,'Underlag':f"Spelare ID {pid}; {hits}/{len(records)} senaste spelade matcher med minst 20 min; startelva ej verifierad; försiktig empirisk uppskattning",
+                        'Status':'KANDIDAT – odds saknas','Player-ID':pid})
+    return result
 
 
 def fixture_stat_pair(fixture_id, key, cache, stat_name):
@@ -139,87 +233,118 @@ def fixture_stat_pair(fixture_id, key, cache, stat_name):
     return {tid:stats[stat_name] for tid,stats in values.items() if stat_name in stats} or None
 
 
-def fetch_fixture_odds(fixture_id,key,bookmaker=BET365_BOOKMAKER_ID):
-    """Retrieve all available pre-match odds pages, bounded to avoid runaway calls."""
-    offers=[]; errors=[]
-    for page in range(1,5):
-        params={'fixture':fixture_id,'page':page}
-        if bookmaker is not None: params['bookmaker']=bookmaker
-        try:
-            response=api('/odds',key,params)
-        except RuntimeError as exc:
-            errors.append(str(exc));break
-        for event in response:
-            for book in event.get('bookmakers',[]):
-                # Defense in depth: accept Bet365 only, even if API ignores the filter.
-                if 'bet365' not in norm(book.get('name', '')).replace(' ', ''):
-                    continue
-                for bet in book.get('bets',[]):
-                    for value in bet.get('values',[]):
-                        try: price=float(str(value.get('odd','')).replace(',','.'))
-                        except (ValueError,TypeError):continue
-                        if price>1:
-                            offers.append({'bookmaker':book.get('name','?'),'market':str(bet.get('name','')),'selection':str(value.get('value','')),'odd':price,'updated':event.get('update','')})
-        if not response: break
-    return offers,errors
-
-
 def norm(value):
-    import re,unicodedata
+    import re, unicodedata
     s=unicodedata.normalize('NFKD',str(value)).encode('ascii','ignore').decode().lower()
     return re.sub(r'[^a-z0-9.]+',' ',s).strip()
 
 
+def fetch_fixture_odds(fixture_id,key,bookmaker=BET365_BOOKMAKER_ID):
+    """Return only named Bet365 prices for this fixture, retaining market IDs and timestamps."""
+    offers=[]; errors=[]
+    for page in range(1,11):
+        try:
+            response=api('/odds',key,{'fixture':fixture_id,'bookmaker':bookmaker,'page':page})
+        except RuntimeError as exc:
+            errors.append(str(exc));break
+        if not response:break
+        for event in response:
+            if event.get('fixture',{}).get('id') not in (None,fixture_id):continue
+            for book in event.get('bookmakers',[]):
+                if norm(book.get('name','')).replace(' ','')!='bet365':continue
+                for bet in book.get('bets',[]):
+                    for value in bet.get('values',[]):
+                        try:price=float(str(value.get('odd','')).replace(',','.'))
+                        except (ValueError,TypeError):continue
+                        if 1<price<1001:
+                            offers.append({'bookmaker':book.get('name'),'bookmaker_id':book.get('id'),
+                                           'market':str(bet.get('name','')),'market_id':bet.get('id'),
+                                           'selection':str(value.get('value','')),'odd':price,
+                                           'updated':event.get('update') or book.get('update') or ''})
+        if len(response)<10:break
+    return offers,errors
+
+
+def _selection(offer):
+    return norm(offer['selection'])
+
+
 def match_offer(candidate,offer,fixture):
-    """Only match exact supported market/selection shapes; no guessed mapping."""
-    name=norm(candidate['Spel']); market=norm(offer['market']); selection=norm(offer['selection'])
-    home=norm(fixture['teams']['home']['name']); away=norm(fixture['teams']['away']['name'])
-    if name.startswith('over '):
-        import re
-        m=re.search(r'over (\d+\.5) goals',name)
-        if m and any(t in market for t in ('goals over under','over under goals','total goals','over under')):
-            return selection in ('over '+m.group(1), 'over '+m.group(1).replace('.',' '))
-    if name=='bada lagen gor mal':
-        return ('both teams to score' in market or 'both teams score' in market) and selection=='yes'
+    """Strict allowlist. Reject ambiguous market names instead of attaching wrong prices."""
     import re
-    m=re.match(r'(.+?) over (\d+\.5) (team goals|corners|yellow cards)',name)
-    # Swedish normalized candidate labels handled separately.
-    if not m:
-        for label,eng in [('lagmal','team goals'),('hornor','corners'),('gula kort','yellow cards')]:
-            m2=re.match(r'(.+?) over (\d+\.5) '+label+'$',name)
-            if m2:
-                m=(m2.group(1),m2.group(2),eng);break
-    else:m=(m.group(1),m.group(2),m.group(3))
+    name=norm(candidate['Spel']); market=norm(offer['market']); selection=_selection(offer)
+    home=norm(fixture['teams']['home']['name']); away=norm(fixture['teams']['away']['name'])
+    if name=='bada lagen gor mal':
+        return market in ('both teams to score','both teams score','both teams to score yes no') and selection=='yes'
+    if name.startswith('1x2 '):
+        if market not in ('match winner','1x2','full time result'):return False
+        choice=name.split()[-1]
+        return (choice=='1' and selection in ('home',home,'1')) or (choice=='2' and selection in ('away',away,'2')) or (choice=='x' and selection in ('draw','x'))
+    m=re.fullmatch(r'(.+?) AH ([+-]?\d+\.5)',candidate['Spel'])
+    if m:
+        team,line=m.groups()
+        team=norm(team)
+        if team not in (home,away):return False
+        side='home' if team==home else 'away'
+        # Only accept explicit team-labelled Asian handicap markets and exact line.
+        if market not in ('asian handicap','asian handicaps','handicap asian'):return False
+        if not (selection.startswith(side+' ') or selection.startswith(team+' ')):return False
+        raw_selection=str(offer['selection']).strip().lower()
+        return raw_selection in (f'{side} {line}',f'{team} {line}')
+    m=re.fullmatch(r'(over|under) (\d+\.5) (goals|mal)',name)
+    if m:
+        if market not in ('goals over under','over under goals','total goals over under','total goals'):return False
+        return selection==f'{m.group(1)} {m.group(2)}'
+    m=re.fullmatch(r'(.+?) (over|under) (\d+\.5) (lagmal|hornor|gula kort)',name)
     if not m:return False
-    team,line,kind=m
+    team,direction,line,kind=m.groups()
     if team not in (home,away):return False
-    home_team=team==home
-    if kind=='team goals':
-        compatible=('home team' in market or 'home goals' in market) if home_team else ('away team' in market or 'away goals' in market)
-        compatible=compatible or ('team total' in market and team in market)
-    elif kind=='corners':
-        compatible='corner' in market and (('home' in market) if home_team else ('away' in market))
+    side='home' if team==home else 'away'
+    if kind=='lagmal':
+        valid={f'{side} team over under',f'{side} goals over under',f'{side} team goals over under',f'{side} total goals'}
+    elif kind=='hornor':
+        valid={f'{side} corners over under',f'{side} corner over under',f'{side} team corners',f'{side} corners'}
     else:
-        compatible=('card' in market or 'booking' in market) and (('home' in market) if home_team else ('away' in market))
-    return compatible and selection in ('over '+line,team+' over '+line)
+        valid={f'{side} cards over under',f'{side} yellow cards over under',f'{side} cards',f'{side} bookings over under'}
+    return market in valid and selection==f'{direction} {line}'
+
+
+def _recent_timestamp(value, now, max_hours=48):
+    if not value:return False
+    try:
+        dt=datetime.fromisoformat(value.replace('Z','+00:00'))
+        if dt.tzinfo is None:dt=dt.replace(tzinfo=timezone.utc)
+        return timedelta(0)<=now-dt<=timedelta(hours=max_hours)
+    except (ValueError,TypeError):return False
 
 
 def attach_odds(rows,fixtures,key):
-    indexed={f["teams"]["home"]["name"]+' – '+f["teams"]["away"]["name"]:f for f in fixtures}
-    errors=[]
+    indexed={f['teams']['home']['name']+' – '+f['teams']['away']['name']:f for f in fixtures}
+    errors=[];now=datetime.now(timezone.utc)
     for match,fx in indexed.items():
         relevant=[r for r in rows if r['Match']==match]
         if not relevant:continue
-        offers,err=fetch_fixture_odds(fx['fixture']['id'],key,bookmaker=BET365_BOOKMAKER_ID)
+        offers,err=fetch_fixture_odds(fx['fixture']['id'],key)
         errors.extend([f'{match}: {e}' for e in err])
         for r in relevant:
             choices=[o for o in offers if match_offer(r,o,fx)]
             if not choices:continue
-            best=max(choices,key=lambda o:o['odd'])
-            r['Aktuellt odds']=best['odd']
-            r['Spelbolag']=best['bookmaker']
-            r['Oddskälla']='API-Football /odds (förhandsodds)'
-            r['Status']='SPELBAR KANDIDAT' if best['odd']>=max(MIN_MARKET_ODDS,r['Minimiodds']) else 'AVSTÅ – för lågt odds'
+            # If timestamp is missing/stale, never claim a live verified Bet365 price.
+            valid=[o for o in choices if _recent_timestamp(o['updated'],now)]
+            if not valid:
+                r['Status']='KANDIDAT – Bet365-odds för gammalt eller utan tidsstämpel'
+                continue
+            # Prefer latest snapshot, not maximum historical price.
+            latest=max(valid,key=lambda o:o['updated'])
+            same_time=[o for o in valid if o['updated']==latest['updated']]
+            prices={o['odd'] for o in same_time}
+            if len(prices)>1:
+                r['Status']='KANDIDAT – motstridiga Bet365-odds'
+                continue
+            r['Aktuellt odds']=latest['odd'];r['Spelbolag']='Bet365'
+            r['Odds kontrollerat']=latest['updated'];r['Oddskälla']='API-Football /odds'
+            r['Marknads-ID']=latest['market_id']
+            r['Status']='SPELA – API-verifierat' if latest['odd']>=max(MIN_MARKET_ODDS,r['Minimiodds']) else 'AVSTÅ – för lågt odds'
     return errors
 
 
@@ -251,7 +376,7 @@ def bet365_rows(report):
                 rows.append({'Marknad':bet.get('name',''), 'Marknads-ID':bet.get('id',''), 'Antal utfall':len(vals), 'Exempel på utfall':', '.join(str(v.get('value','')) for v in vals[:4])})
     return matching,rows
 
-st.title('⚽ EDGEAI PRO 1.5 – Bet365')
+st.title('⚽ EDGEAI PRO 1.7 – Bet365')
 st.caption('Datadriven matchscreening • inga påhittade odds • samma sparade analys kan öppnas igen')
 with st.sidebar:
     st.header('Inställningar')
@@ -357,8 +482,9 @@ with st.expander('✍️ Kontrollera odds och jämför med minimiodds',expanded=
             st.caption(f'Indikativt EV enligt okalibrerad modell: {edge:+.1f} %. Källa: {bookmaker or "ej angiven"}. Kontrollera att marknaden och linan är identiska. Inte ett säkerställt spelvärde.')
     else:st.info('Kör eller öppna en tidigare analys först.')
 
-enable_extra_stats=st.checkbox('Analysera även hörnor och kort (fler API-anrop)',value=False,help='Hämtar statistik per historisk match. Kan använda många API-anrop.')
+enable_extra_stats=st.checkbox('Analysera hörnor och kort',value=True,help='På som standard. Kräver ytterligare API-anrop för historiska matcher.')
 enable_odds=st.checkbox('Hämta Bet365-odds automatiskt (endast Bet365)',value=True)
+enable_players=st.checkbox('Analysera spelarskott och skott på mål',value=True,help='Hämtar /fixtures/players för tidigare matcher. Kan använda många API-anrop. Spelarodds visas som ej verifierade om exakt marknadsmatchning saknas.')
 run=st.button('▶ KÖR ANALYS',type='primary',disabled=not bool(key and selected))
 if run:
     try:
@@ -366,25 +492,47 @@ if run:
             games=api('/fixtures',key,{'date':day.isoformat()})
             games=[g for g in games if g['league']['id'] in selected and g['fixture']['status']['short'] in ('NS','TBD')]
             games.sort(key=lambda g:g['fixture']['date'])
-            cache={}; stats_cache={}; rows=[]; missing=[]
+            cache={}; stats_cache={}; player_cache={}; rows=[]; missing=[]
             progress=st.progress(0)
             for i,g in enumerate(games):
                 try:
                     found,reason=candidates(g,key,cache,day.isoformat(),stats_cache if enable_extra_stats else None)
                     rows.extend(found)
+                    if enable_players and not reason:
+                        rows.extend(player_candidates(g,key,cache,player_cache,day.isoformat()))
                     if reason: missing.append(f"{g['teams']['home']['name']}–{g['teams']['away']['name']}: {reason}")
                 except RuntimeError as e:
                     missing.append(f"{g['teams']['home']['name']}–{g['teams']['away']['name']}: {e}")
                 progress.progress((i+1)/len(games))
             if enable_odds:
                 missing.extend(attach_odds(rows,games,key))
-            rows.sort(key=lambda x:(-x['Styrka 1–10'],-x['Sannolikhet %'],x['Match'],x['Spel']))
+            rows.sort(key=lambda x:(x['Status'].startswith('SPELA')==False,-x['Styrka 1–10'],-x['Sannolikhet %'],x['Match'],x['Spel']))
             for i,r in enumerate(rows):r['Rank']=i+1
             payload={'matches':len(games),'rows':rows,'missing':missing,'date':day.isoformat(),'created':datetime.now(timezone.utc).isoformat()}
             c=connect();c.execute('INSERT INTO runs(created,match_date,payload) VALUES(?,?,?)',(payload['created'],day.isoformat(),json.dumps(payload,ensure_ascii=False)));c.commit();c.close()
             st.session_state['analysis']=payload
     except RuntimeError as e:
         st.error(f'API-anrop misslyckades: {e}')
+
+with st.expander('Importera historik från JSON',expanded=False):
+    upload=st.file_uploader('Historikfil från tidigare EDGEAI-installation',type=['json'],key='history_upload')
+    if upload is not None and st.button('IMPORTERA HISTORIK'):
+        try:
+            entries=json.load(upload)
+            if not isinstance(entries,list):raise ValueError('Förväntade en lista av analyser')
+            count=0
+            with connect() as conn:
+                existing={r[0] for r in conn.execute('SELECT created FROM runs')}
+                for item in entries[:5000]:
+                    if not isinstance(item,dict):continue
+                    payload=item.get('payload'); created=item.get('created'); match_date=item.get('date')
+                    if not isinstance(payload,dict) or not isinstance(created,str) or not isinstance(match_date,str):continue
+                    if created in existing:continue
+                    conn.execute('INSERT INTO runs(created,match_date,payload) VALUES(?,?,?)',(created,match_date,json.dumps(payload,ensure_ascii=False)))
+                    existing.add(created);count+=1
+            st.success(f'{count} analyser importerades.')
+        except (ValueError,TypeError,KeyError,json.JSONDecodeError) as exc:
+            st.error(f'Felaktig historikfil: {exc}')
 
 with st.expander('Tidigare analyser (sparade på servern)',expanded=False):
     c=connect();history=c.execute('SELECT id,created,match_date FROM runs ORDER BY id DESC LIMIT 30').fetchall();c.close()
@@ -394,15 +542,19 @@ with st.expander('Tidigare analyser (sparade på servern)',expanded=False):
             c=connect();data=c.execute('SELECT payload FROM runs WHERE id=?',(choice[0],)).fetchone();c.close()
             if data:st.session_state['analysis']=json.loads(data[0])
     else:st.write('Ingen historik ännu.')
+    if history:
+        c=connect();all_runs=c.execute('SELECT created,match_date,payload FROM runs ORDER BY id').fetchall();c.close()
+        st.download_button('Exportera historik (JSON)',json.dumps([{'created':a,'date':b,'payload':json.loads(c)} for a,b,c in all_runs],ensure_ascii=False,indent=2).encode('utf-8'),file_name='edgeai_history.json',mime='application/json')
 
 p=st.session_state.get('analysis')
 if p:
     st.subheader(f"Analys {p['date']}")
     st.write(f"**{p['matches']} matcher**, **{len(p['rows'])} statistiska spelkandidater**. Analysen sparades {p['created'][:16]} UTC.")
-    st.warning('Version 1.5: mål samt valbara hörn- och kortmarknader. Endast Bet365-odds från API-Football används automatiskt. 1X2, handikapp och spelarskott har ännu ingen fullständig analysmodell. Sannolikheterna är okalibrerade; en träff i odds-API garanterar inte att oddset fortfarande går att spela. Historiken på Streamlit-servern är inte permanent.')
+    st.warning('Version 1.7: även Asian Handicap med halvmålslinor och historiska spelarskott analyseras. Spelarskott kräver minst fem observerade matcher och bekräftar inte startelva. Modellerna är inte kalibrerade eller historiskt validerade. Endast exakt matchade Bet365-odds visas som verifierade. SQLite kräver beständig serverdisk för att överleva omstarter.')
     if p['rows']:
+        st.markdown('### 🏆 EDGEAI – DAGENS BÄSTA SPEL')
         df=pd.DataFrame(p['rows'])
-        cols=['Rank','Match','Tävling','Spel','Sannolikhet %','Sannolikhet 1–10','Minimiodds','Aktuellt odds','Styrka 1–10','Status']
+        cols=['Rank','Match','Tävling','Spel','Sannolikhet %','Sannolikhet 1–10','Minimiodds','Aktuellt odds','Styrka 1–10','Status','Odds kontrollerat']
         if 'Spelbolag' in df.columns: cols.insert(cols.index('Status'),'Spelbolag')
         st.dataframe(df.reindex(columns=cols).head(30),hide_index=True,use_container_width=True)
         with st.expander('Metod och underlag'):

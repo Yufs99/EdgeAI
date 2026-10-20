@@ -1,24 +1,29 @@
-# EDGEAI PRO 1.4
+# EDGEAI PRO 1.6 – Streamlit / Bet365
 
-Streamlit app using API-Football. Entry point: `edgeai_pro/app.py` when repository contains the `edgeai_pro` folder.
+## Start
 
-## New
-- Automatically requests available pre-match odds for each eligible fixture (multiple bookmakers, up to four result pages).
-- Only attaches a quote when market, selection, team and line can be matched conservatively; otherwise labels it unverified.
-- Optional corner and yellow-card screening from per-fixture historical statistics. This option uses many API calls and is off by default.
-- Applies 1.50 minimum quoted odds and candidate-specific minimum odds.
+```bash
+pip install -r requirements.txt
+streamlit run app.py
+```
 
-## Limitations
-- The analysis engine is still a prototype. It does not yet model 1X2, handicaps, player shots or shots on target.
-- Odds markets vary by bookmaker and fixture; no guarantee of current executable prices. Only exact recognized market/selection pairs are auto-matched.
-- Historical corner/card data may be missing; uncalibrated probability estimates are not validated forecasts.
-- SQLite storage on Streamlit Community Cloud is ephemeral; use external database for persistent history.
-- API-Football quota usage can be substantial when corner/card analysis is enabled.
+Add your API-Football key in the sidebar, or use Streamlit secrets `API_FOOTBALL_KEY`. Never publish secrets or API keys in Git.
 
-## Deploy
-Replace `edgeai_pro/app.py`, `edgeai_pro/README.md`, and keep `edgeai_pro/requirements.txt`. Streamlit entry point `edgeai_pro/app.py`.
-Keep API keys in Streamlit Secrets, e.g. `API_FOOTBALL_KEY = "..."`, never commit keys.
+## Improvements from 1.5
 
+- 1X2 and under-goals candidate models added alongside existing over-goals and BTTS.
+- Team corners and cards enabled by default and screened over multiple over/under lines when fixture statistics exist.
+- Strict Bet365-only odds matching: exact fixture, market category, side, line and selection. Unsupported and ambiguous market labels are not auto-matched.
+- Odds without a parseable timestamp from the last 48 hours are not treated as verified; conflicting latest prices are rejected. These are API snapshots, not guaranteed live Bet365 Sweden prices.
+- Verified playable candidates appear ahead of unverified candidates, with deterministic tie-breaking.
+- Analysis history can be reopened and exported as JSON.
+- Regression checks: `python test_market_matching.py`.
 
-## Version 1.5 – Bet365-only odds
-Automatiska odds hämtas från API-Football `/odds` med `bookmaker=8` (Bet365). API-svar filtreras dessutom på Bet365-namnet. Om Bet365 saknar odds visas kandidaten som overifierad; odds från andra spelbolag ersätter aldrig dessa. Den frivilliga webbsökningen är endast research och används inte för automatisk ranking. Historiska analyser kan fortfarande visa gamla odds från tidigare versioner.
+## Important limitations
+
+- API-Football market labels can differ by competition. The strict allowlist may leave genuine prices unverified rather than risk attaching a wrong market.
+- The 1X2, goals, corners and cards probability estimates are **not calibrated or backtested**. A high model score is not proof of positive EV.
+- Handicap, player shots, player cards and assists are **not yet modeled**. These require appropriate historical/player data and additional validation; no fake coverage is claimed.
+- `EDGEAI_DB_PATH` defaults to `edgeai_history.sqlite3` in the working directory. Set it to a persistent mounted disk path to retain history across Streamlit server restarts. Ephemeral Streamlit hosting does not guarantee disk persistence.
+- The odds endpoint may not return all Bet365 markets, and its timestamps may be stale. Check the Bet365 app before placing bets.
+- Live API verification was not performed in this offline build; check bookmaker ID and market naming using the in-app diagnostic tool.
